@@ -187,9 +187,6 @@ public class SameNamedModulesDifferentClassLoaders {
                         throw new AssertionError("Expected source and target loader details: " + message);
                     }
                 }
-            } finally {
-                // Explicitly close loaders even if test code throws.
-                sourceLoader.close();
             }
         }
     }
