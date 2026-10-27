@@ -1,0 +1,60 @@
+diff --git a/src/hotspot/share/runtime/reflection.cpp b/src/hotspot/share/runtime/reflection.cpp
+--- a/src/hotspot/share/runtime/reflection.cpp
++++ b/src/hotspot/share/runtime/reflection.cpp
+@@ -545,7 +545,16 @@
+     ModuleEntry* module_to = nullptr;
+     module_to = new_class->module();
+     const char * module_to_name = module_to->is_named() ? module_to->name()->as_C_string() : UNNAMED_MODULE;
+     const char * new_class_name = new_class->external_name();
++    const bool same_named_module_different_loaders =
++        module_from->is_named() && module_to->is_named() &&
++        module_from->name() == module_to->name() &&
++        current_class->class_loader_data() != new_class->class_loader_data();
++    const char* loader_phrase = same_named_module_different_loaders ? " of loader " : "";
++    const char* current_loader_name = same_named_module_different_loaders
++        ? current_class->class_loader_data()->loader_name_and_id() : "";
++    const char* new_loader_name = same_named_module_different_loaders
++        ? new_class->class_loader_data()->loader_name_and_id() : "";
+ 
+     if (result == MODULE_NOT_READABLE) {
+       assert(module_from->is_named(), "Unnamed modules can read all modules");
+       if (module_to->is_named()) {
+-        size_t len = 100 + strlen(current_class_name) + 2*strlen(module_from_name) +
+-          strlen(new_class_name) + 2*strlen(module_to_name);
++        size_t len = 256 + strlen(current_class_name) + 2*strlen(module_from_name) +
++          2*strlen(current_loader_name) + strlen(new_class_name) +
++          2*strlen(module_to_name) + 2*strlen(new_loader_name);
+         msg = NEW_RESOURCE_ARRAY(char, len);
+         jio_snprintf(msg, len,
+-          "class %s (in module %s) cannot access class %s (in module %s) because module %s does not read module %s",
+-          current_class_name, module_from_name, new_class_name,
+-          module_to_name, module_from_name, module_to_name);
++          "class %s (in module %s%s%s) cannot access class %s "
++          "(in module %s%s%s) because module %s%s%s does not read module %s%s%s",
++          current_class_name, module_from_name, loader_phrase, current_loader_name,
++          new_class_name, module_to_name, loader_phrase, new_loader_name,
++          module_from_name, loader_phrase, current_loader_name,
++          module_to_name, loader_phrase, new_loader_name);
+@@ -579,9 +588,13 @@
+       assert(new_class->package() != nullptr,
+              "Unnamed packages are always exported");
+       const char * package_name =
+         new_class->package()->name()->as_klass_external_name();
+       assert(module_to->is_named(), "Unnamed modules export all packages");
+       if (module_from->is_named()) {
+-        size_t len = 118 + strlen(current_class_name) + 2*strlen(module_from_name) +
+-          strlen(new_class_name) + 2*strlen(module_to_name) + strlen(package_name);
++        size_t len = 256 + strlen(current_class_name) + 2*strlen(module_from_name) +
++          2*strlen(current_loader_name) + strlen(new_class_name) +
++          2*strlen(module_to_name) + 2*strlen(new_loader_name) + strlen(package_name);
+         msg = NEW_RESOURCE_ARRAY(char, len);
+         jio_snprintf(msg, len,
+-          "class %s (in module %s) cannot access class %s (in module %s) because module %s does not export %s to module %s",
+-          current_class_name, module_from_name, new_class_name,
+-          module_to_name, module_to_name, package_name, module_from_name);
++          "class %s (in module %s%s%s) cannot access class %s "
++          "(in module %s%s%s) because module %s%s%s does not export %s to module %s%s%s",
++          current_class_name, module_from_name, loader_phrase, current_loader_name,
++          new_class_name, module_to_name, loader_phrase, new_loader_name,
++          module_to_name, loader_phrase, new_loader_name, package_name,
++          module_from_name, loader_phrase, current_loader_name);
