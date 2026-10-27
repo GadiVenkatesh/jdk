@@ -33,6 +33,8 @@ import java.io.OutputStream;
 import java.lang.module.Configuration;
 import java.lang.module.ModuleFinder;
 import java.lang.reflect.InvocationTargetException;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -60,6 +62,7 @@ public class SameNamedModulesDifferentClassLoaders {
         Path sourceClasses = Files.createDirectories(work.resolve("source-classes"));
         Path targetClasses = Files.createDirectories(work.resolve("target-classes"));
         Path targetHiddenClasses = Files.createDirectories(work.resolve("target-hidden-classes"));
+        Path exportedClasses = Files.createDirectories(work.resolve("target-exported-classes"));
 
         Path sourceClass = sourceDir.resolve("c1.java");
         Path targetClass = targetDir.resolve("c2.java");
@@ -87,22 +90,18 @@ public class SameNamedModulesDifferentClassLoaders {
         compile(compiler, "-d", sourceClasses.toString(), sourceModuleInfo.toString());
 
         Path targetClassFile = targetClasses.resolve("p2/c2.class");
-        Path exportedClassFile = work.resolve("target-exported-classes/p2/c2.class");
-        Path hiddenClassFile = targetHiddenClasses.resolve("p2/c2.class");
-        Files.createDirectories(exportedClassFile.getParent());
-        Files.createDirectories(hiddenClassFile.getParent());
-        Files.copy(targetClassFile, exportedClassFile);
-        Files.copy(targetClassFile, hiddenClassFile);
-        compile(compiler, "-d", work.resolve("target-exported-classes").toString(),
-                targetExportedModuleInfo.toString());
+        Files.copy(targetClassFile, exportedClasses.resolve("p2/c2.class"));
+        Files.copy(targetClassFile, targetHiddenClasses.resolve("p2/c2.class"));
+        compile(compiler, "-d", exportedClasses.toString(), targetExportedModuleInfo.toString());
         compile(compiler, "-d", targetHiddenClasses.toString(), targetHiddenModuleInfo.toString());
 
         Path sourceJar = createJar(work.resolve("source.jar"), sourceClasses);
-        Path exportedTargetJar = createJar(work.resolve("target-exported.jar"),
-                work.resolve("target-exported-classes"));
+        Path exportedTargetJar = createJar(work.resolve("target-exported.jar"), exportedClasses);
         Path hiddenTargetJar = createJar(work.resolve("target-hidden.jar"), targetHiddenClasses);
 
+        // Same-named modules in different class loaders, without a read edge.
         expectDiagnostic(sourceJar, exportedTargetJar, false, "does not read module");
+        // Once readability is added, the non-exported package is the restriction.
         expectDiagnostic(sourceJar, hiddenTargetJar, true, "does not export p2");
     }
 
@@ -134,53 +133,75 @@ public class SameNamedModulesDifferentClassLoaders {
 
     private static void expectDiagnostic(Path sourceJar, Path targetJar,
                                          boolean addReadEdge, String expectedReason) throws Exception {
-        ModuleLayer targetLayer = ModuleLayer.boot().defineModulesWithOneLoader(
-                resolve(targetJar), ClassLoader.getSystemClassLoader());
-        Configuration sourceConfiguration = ModuleLayer.boot().configuration()
-                .resolve(ModuleFinder.of(sourceJar), ModuleFinder.of(), Set.of(MODULE_NAME));
-        ModuleLayer.Controller controller = ModuleLayer.defineModulesWithOneLoader(
-                sourceConfiguration, List.of(ModuleLayer.boot(), targetLayer),
-                ClassLoader.getSystemClassLoader());
-        ModuleLayer sourceLayer = controller.layer();
+        ClassLoader platformLoader = ClassLoader.getPlatformClassLoader();
+        try (URLClassLoader targetLoader = new URLClassLoader(
+                     new URL[] { targetJar.toUri().toURL() }, platformLoader)) {
+            ModuleLayer targetLayer = defineLayer(targetJar, targetLoader);
 
-        Module sourceModule = sourceLayer.findModule(MODULE_NAME).orElseThrow();
-        Module targetModule = targetLayer.findModule(MODULE_NAME).orElseThrow();
-        if (addReadEdge) {
-            controller.addReads(sourceModule, targetModule);
-        }
+            URLClassLoader sourceLoader = new URLClassLoader(
+                    new URL[] { sourceJar.toUri().toURL() }, platformLoader) {
+                @Override
+                protected Class<?> loadClass(String name, boolean resolve)
+                        throws ClassNotFoundException {
+                    if (name.equals("p2.c2")) {
+                        return targetLoader.loadClass(name);
+                    }
+                    return super.loadClass(name, resolve);
+                }
+            };
+            try (sourceLoader) {
+                ModuleLayer.Controller controller = defineLayerController(sourceJar, sourceLoader);
+                ModuleLayer sourceLayer = controller.layer();
 
-        Class<?> sourceClass = sourceLayer.findLoader(MODULE_NAME).loadClass("p1.c1");
-        Class<?> targetClass = targetLayer.findLoader(MODULE_NAME).loadClass("p2.c2");
-        if (sourceClass.getModule() == targetClass.getModule()
-                || !sourceModule.getName().equals(targetModule.getName())
-                || sourceClass.getClassLoader() == targetClass.getClassLoader()) {
-            throw new AssertionError("Test setup did not create same-named modules in different loaders");
-        }
+                Module sourceModule = sourceLayer.findModule(MODULE_NAME).orElseThrow();
+                Module targetModule = targetLayer.findModule(MODULE_NAME).orElseThrow();
+                if (addReadEdge) {
+                    controller.addReads(sourceModule, targetModule);
+                }
 
-        try {
-            sourceClass.getDeclaredConstructor().newInstance();
-            throw new AssertionError("Expected IllegalAccessError for " + expectedReason);
-        } catch (InvocationTargetException e) {
-            Throwable cause = e.getCause();
-            if (!(cause instanceof IllegalAccessError)) {
-                throw new AssertionError("Expected IllegalAccessError, got " + cause, cause);
-            }
-            String message = cause.getMessage();
-            requireContains(message, "p1.c1");
-            requireContains(message, "p2.c2");
-            requireContains(message, MODULE_NAME);
-            requireContains(message, expectedReason);
-            requireContains(message, "of loader");
-            int firstLoader = message.indexOf("of loader");
-            if (message.indexOf("of loader", firstLoader + 1) < 0) {
-                throw new AssertionError("Expected source and target loader details: " + message);
+                Class<?> sourceClass = sourceLayer.findLoader(MODULE_NAME).loadClass("p1.c1");
+                Class<?> targetClass = targetLayer.findLoader(MODULE_NAME).loadClass("p2.c2");
+                if (sourceClass.getModule() == targetClass.getModule()
+                        || !sourceModule.getName().equals(targetModule.getName())
+                        || sourceClass.getClassLoader() == targetClass.getClassLoader()) {
+                    throw new AssertionError(
+                            "Test setup did not create same-named modules in different loaders");
+                }
+
+                try {
+                    sourceClass.getDeclaredConstructor().newInstance();
+                    throw new AssertionError("Expected IllegalAccessError for " + expectedReason);
+                } catch (InvocationTargetException e) {
+                    Throwable cause = e.getCause();
+                    if (!(cause instanceof IllegalAccessError)) {
+                        throw new AssertionError("Expected IllegalAccessError, got " + cause, cause);
+                    }
+                    String message = cause.getMessage();
+                    requireContains(message, "p1.c1");
+                    requireContains(message, "p2.c2");
+                    requireContains(message, MODULE_NAME);
+                    requireContains(message, expectedReason);
+                    requireContains(message, "of loader");
+                    int firstLoader = message.indexOf("of loader");
+                    if (message.indexOf("of loader", firstLoader + 1) < 0) {
+                        throw new AssertionError("Expected source and target loader details: " + message);
+                    }
+                }
+            } finally {
+                // Explicitly close loaders even if test code throws.
+                sourceLoader.close();
             }
         }
     }
 
-    private static Configuration resolve(Path jar) {
-        return ModuleLayer.boot().configuration()
+    private static ModuleLayer defineLayer(Path jar, ClassLoader loader) {
+        return defineLayerController(jar, loader).layer();
+    }
+
+    private static ModuleLayer.Controller defineLayerController(Path jar, ClassLoader loader) {
+        Configuration configuration = ModuleLayer.boot().configuration()
                 .resolve(ModuleFinder.of(jar), ModuleFinder.of(), Set.of(MODULE_NAME));
+        return ModuleLayer.defineModules(configuration, List.of(ModuleLayer.boot()), name -> loader);
     }
 
     private static void requireContains(String text, String expected) {
